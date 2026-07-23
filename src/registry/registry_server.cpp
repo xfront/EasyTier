@@ -373,13 +373,12 @@ void registry_server::notify_node_joined(NodeId node_id, VirtualIP vip,
 }
 
 void registry_server::notify_node_left(NodeId node_id) {
-    // Build NODE_LEFT frame with just the node_id
-    std::vector<uint8_t> payload_buf(8);
-    NodeId nid = node_id;
-    for (int i = 7; i >= 0; --i) {
-        payload_buf[i] = static_cast<uint8_t>(nid & 0xFF);
-        nid >>= 8;
-    }
+    // Build NODE_LEFT frame with the node_id (4 bytes, big-endian)
+    std::vector<uint8_t> payload_buf(4);
+    payload_buf[0] = static_cast<uint8_t>((node_id >> 24) & 0xFF);
+    payload_buf[1] = static_cast<uint8_t>((node_id >> 16) & 0xFF);
+    payload_buf[2] = static_cast<uint8_t>((node_id >> 8) & 0xFF);
+    payload_buf[3] = static_cast<uint8_t>(node_id & 0xFF);
 
     frame f{msg_type::NODE_LEFT, std::move(payload_buf)};
 

@@ -3,6 +3,7 @@
 #include <async_net/crypto/aes_gcm.hpp>
 #include <cstring>
 #include <algorithm>
+#include <random>
 
 namespace easytier::crypto {
 
@@ -42,115 +43,197 @@ std::vector<uint8_t> hkdf_expand(const uint8_t* prk, size_t prk_len,
     return okm;
 }
 
+/// Generate random bytes using async_net
+std::vector<uint8_t> gen_random(size_t len) {
+    return async_net::crypto::aes_gcm::random_bytes(len);
+}
+
 } // anonymous namespace
 
-session_cipher::session_cipher(const uint8_t key[KEY_LEN]) {
-    std::memcpy(key_.data(), key, KEY_LEN);
+// ============================================================
+// Constructors
+// ============================================================
+
+session_cipher::session_cipher(const uint8_t key[KEY_LEN_128])
+    : key_len_(KEY_LEN_128), is_256_(false) {
+    std::memcpy(key_.data(), key, KEY_LEN_128);
 }
 
-session_cipher::session_cipher(const std::vector<uint8_t>& key) {
-    if (key.size() >= KEY_LEN) {
-        std::memcpy(key_.data(), key.data(), KEY_LEN);
+session_cipher::session_cipher(const uint8_t key[KEY_LEN_256], bool use_256)
+    : key_len_(KEY_LEN_256), is_256_(use_256) {
+    std::memcpy(key_.data(), key, KEY_LEN_256);
+}
+
+session_cipher::session_cipher(const std::vector<uint8_t>& key)
+    : is_256_(key.size() > KEY_LEN_128) {
+    key_len_ = key.size() > KEY_LEN_128 ? KEY_LEN_256 : KEY_LEN_128;
+    std::memcpy(key_.data(), key.data(), std::min(key.size(), key_.size()));
+}
+
+// ============================================================
+// ZCPacket encrypt/decrypt — Rust-compatible format
+// ============================================================
+
+bool session_cipher::encrypt(zc_packet& pkt) {
+    auto* pm = pkt.mutable_pm_header();
+    if (!pm) return false;
+    if (pm->is_encrypted()) return true; // already encrypted
+
+    auto payload = pkt.mutable_payload();
+    if (payload.empty()) return true;
+
+    // Generate random 12-byte nonce
+    auto nonce_bytes = gen_random(NONCE_LEN);
+    uint8_t nonce[NONCE_LEN];
+    std::memcpy(nonce, nonce_bytes.data(), NONCE_LEN);
+
+    // Encrypt payload in-place using AES-GCM with empty AAD
+    auto ciphertext = async_net::crypto::aes_gcm::encrypt(
+        key_.data(), key_len_,
+        nonce, NONCE_LEN,
+        payload.data(), payload.size(),
+        nullptr, 0);
+
+    if (ciphertext.empty()) return false;
+
+    // ciphertext includes the tag appended by AES-GCM
+    // Resize payload to hold ciphertext + nonce
+    auto& buf = pkt.mutable_buffer();
+    size_t pm_off = 0;
+    // Calculate PM header offset based on packet type
+    switch (pkt.type()) {
+        case zc_packet_type::TCP: pm_off = TCP_TUNNEL_HEADER_SIZE; break;
+        case zc_packet_type::UDP: pm_off = UDP_TUNNEL_HEADER_SIZE; break;
+        case zc_packet_type::WG:  pm_off = WG_TUNNEL_HEADER_SIZE; break;
+        case zc_packet_type::DummyTunnel: pm_off = 0; break;
+        case zc_packet_type::NIC:
+            pm_off = std::max({TCP_TUNNEL_HEADER_SIZE, UDP_TUNNEL_HEADER_SIZE, WG_TUNNEL_HEADER_SIZE});
+            break;
     }
+    size_t payload_start = pm_off + PEER_MANAGER_HEADER_SIZE;
+
+    // Replace payload with ciphertext + tail
+    buf.resize(payload_start + ciphertext.size() + NONCE_LEN);
+    std::memcpy(buf.data() + payload_start, ciphertext.data(), ciphertext.size());
+    // Append nonce after ciphertext+tag
+    std::memcpy(buf.data() + payload_start + ciphertext.size(), nonce, NONCE_LEN);
+
+    // Update PM header
+    pm = pkt.mutable_pm_header();
+    pm->set_encrypted(true);
+    pm->set_len(static_cast<uint32_t>(ciphertext.size() + NONCE_LEN));
+
+    return true;
 }
 
-void session_cipher::build_aad(uint8_t* aad, uint64_t src_node, uint64_t dst_node, uint32_t seq) const {
-    for (int i = 0; i < 8; ++i) {
-        aad[i] = (src_node >> (56 - i * 8)) & 0xff;
-        aad[8 + i] = (dst_node >> (56 - i * 8)) & 0xff;
+bool session_cipher::decrypt(zc_packet& pkt) {
+    auto* pm = pkt.mutable_pm_header();
+    if (!pm) return false;
+    if (!pm->is_encrypted()) return true; // not encrypted
+
+    auto payload = pkt.mutable_payload();
+    if (payload.size() < TAIL_SIZE) return false;
+
+    // Read tail: [tag:16][nonce:12]
+    size_t text_len = payload.size() - TAIL_SIZE;
+    const uint8_t* tag_and_nonce = payload.data() + text_len;
+    // tag is first 16 bytes, nonce is next 12 bytes (matching Rust StandardAeadTail)
+    const uint8_t* tag = tag_and_nonce;
+    const uint8_t* nonce = tag_and_nonce + TAG_LEN;
+
+    // Decrypt using AES-GCM with empty AAD
+    auto plaintext = async_net::crypto::aes_gcm::decrypt(
+        key_.data(), key_len_,
+        nonce, NONCE_LEN,
+        payload.data(), text_len + TAG_LEN, // ciphertext + tag
+        nullptr, 0);
+
+    if (!plaintext) return false;
+
+    // Shrink buffer: remove tail, replace payload with plaintext
+    auto& buf = pkt.mutable_buffer();
+    size_t pm_off = 0;
+    switch (pkt.type()) {
+        case zc_packet_type::TCP: pm_off = TCP_TUNNEL_HEADER_SIZE; break;
+        case zc_packet_type::UDP: pm_off = UDP_TUNNEL_HEADER_SIZE; break;
+        case zc_packet_type::WG:  pm_off = WG_TUNNEL_HEADER_SIZE; break;
+        case zc_packet_type::DummyTunnel: pm_off = 0; break;
+        case zc_packet_type::NIC:
+            pm_off = std::max({TCP_TUNNEL_HEADER_SIZE, UDP_TUNNEL_HEADER_SIZE, WG_TUNNEL_HEADER_SIZE});
+            break;
     }
-    aad[16] = (seq >> 24) & 0xff;
-    aad[17] = (seq >> 16) & 0xff;
-    aad[18] = (seq >> 8) & 0xff;
-    aad[19] = seq & 0xff;
+    size_t payload_start = pm_off + PEER_MANAGER_HEADER_SIZE;
+    buf.resize(payload_start + plaintext->size());
+    std::memcpy(buf.data() + payload_start, plaintext->data(), plaintext->size());
+
+    // Update PM header
+    pm = pkt.mutable_pm_header();
+    pm->set_encrypted(false);
+    pm->set_len(static_cast<uint32_t>(plaintext->size()));
+
+    return true;
 }
 
-void session_cipher::build_nonce(uint8_t* nonce, uint32_t seq) const {
-    std::memcpy(nonce, key_.data(), 4);
-    std::memset(nonce + 4, 0, 4);
-    nonce[8] = (seq >> 24) & 0xff;
-    nonce[9] = (seq >> 16) & 0xff;
-    nonce[10] = (seq >> 8) & 0xff;
-    nonce[11] = seq & 0xff;
-}
+// ============================================================
+// Raw encrypt/decrypt
+// ============================================================
 
-std::vector<uint8_t> session_cipher::encrypt(const uint8_t* plaintext, size_t len,
-                                              uint32_t seq,
-                                              uint64_t src_node, uint64_t dst_node) {
-    uint8_t aad[20];
-    build_aad(aad, src_node, dst_node, seq);
-
-    uint8_t nonce[12];
-    build_nonce(nonce, seq);
+std::vector<uint8_t> session_cipher::encrypt_raw(const uint8_t* plaintext, size_t len) {
+    auto nonce_bytes = gen_random(NONCE_LEN);
+    uint8_t nonce[NONCE_LEN];
+    std::memcpy(nonce, nonce_bytes.data(), NONCE_LEN);
 
     auto ciphertext = async_net::crypto::aes_gcm::encrypt(
-        key_.data(), KEY_LEN,
-        nonce, sizeof(nonce),
+        key_.data(), key_len_,
+        nonce, NONCE_LEN,
         plaintext, len,
-        aad, sizeof(aad));
+        nullptr, 0);
 
     if (ciphertext.empty()) return {};
 
-    std::vector<uint8_t> result(4 + 8 + ciphertext.size());
-    result[0] = (seq >> 24) & 0xff;
-    result[1] = (seq >> 16) & 0xff;
-    result[2] = (seq >> 8) & 0xff;
-    result[3] = seq & 0xff;
-    std::memcpy(result.data() + 4, nonce, 8);
-    std::memcpy(result.data() + 12, ciphertext.data(), ciphertext.size());
-
+    // Result: [ciphertext+tag][nonce]
+    std::vector<uint8_t> result(ciphertext.size() + NONCE_LEN);
+    std::memcpy(result.data(), ciphertext.data(), ciphertext.size());
+    std::memcpy(result.data() + ciphertext.size(), nonce, NONCE_LEN);
     return result;
 }
 
-std::optional<std::vector<uint8_t>> session_cipher::decrypt(const uint8_t* data, size_t len,
-                                                              uint64_t src_node, uint64_t dst_node) {
-    if (len < OVERHEAD) return std::nullopt;
+std::optional<std::vector<uint8_t>> session_cipher::decrypt_raw(const uint8_t* data, size_t len) {
+    if (len < TAIL_SIZE) return std::nullopt;
 
-    uint32_t seq = (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3];
-
-    if (seq < recv_seq_) return std::nullopt;
-
-    uint8_t nonce[12];
-    std::memcpy(nonce, key_.data(), 4);
-    std::memset(nonce + 4, 0, 4);
-    nonce[8] = (seq >> 24) & 0xff;
-    nonce[9] = (seq >> 16) & 0xff;
-    nonce[10] = (seq >> 8) & 0xff;
-    nonce[11] = seq & 0xff;
-
-    const uint8_t* ciphertext = data + 12;
-    size_t ciphertext_len = len - 12;
-
-    uint8_t aad[20];
-    build_aad(aad, src_node, dst_node, seq);
+    size_t text_len = len - TAIL_SIZE;
+    const uint8_t* tag_and_nonce = data + text_len;
+    const uint8_t* nonce = tag_and_nonce + TAG_LEN;
 
     auto plaintext = async_net::crypto::aes_gcm::decrypt(
-        key_.data(), KEY_LEN,
-        nonce, sizeof(nonce),
-        ciphertext, ciphertext_len,
-        aad, sizeof(aad));
+        key_.data(), key_len_,
+        nonce, NONCE_LEN,
+        data, text_len + TAG_LEN,
+        nullptr, 0);
 
-    if (!plaintext) return std::nullopt;
-
-    recv_seq_ = seq + 1;
     return plaintext;
 }
+
+// ============================================================
+// Key derivation
+// ============================================================
 
 std::vector<uint8_t> session_cipher::derive_key(const uint8_t* shared_secret, size_t secret_len,
                                                  const uint8_t* salt, size_t salt_len,
                                                  const char* info, size_t info_len) {
     auto prk = hkdf_extract(salt, salt_len, shared_secret, secret_len);
-    auto okm = hkdf_expand(prk.data(), prk.size(), info, info_len, KEY_LEN);
+    auto okm = hkdf_expand(prk.data(), prk.size(), info, info_len, KEY_LEN_128);
     return okm;
 }
 
-std::vector<uint8_t> session_cipher::generate_key() {
-    return async_net::crypto::aes_gcm::random_bytes(KEY_LEN);
+std::vector<uint8_t> session_cipher::generate_key(size_t len) {
+    return gen_random(len);
 }
 
 std::vector<uint8_t> psk_to_key(const std::string& psk) {
     auto hash = detail::sha256(reinterpret_cast<const uint8_t*>(psk.data()), psk.size());
-    return std::vector<uint8_t>(hash.begin(), hash.end());
+    // Return first 16 bytes for AES-128-GCM (Rust default)
+    return std::vector<uint8_t>(hash.begin(), hash.begin() + 16);
 }
 
 } // namespace easytier::crypto

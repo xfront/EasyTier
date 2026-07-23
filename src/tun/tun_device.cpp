@@ -12,7 +12,6 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
-
 namespace easytier {
 
 tun_device::tun_device(async_net::io_context& ctx,
@@ -160,6 +159,7 @@ async_net::Task<ssize_t> tun_device::async_read(void* buf, size_t len) {
         void* buf_;
         size_t len_;
         std::shared_ptr<async_net::ReadContext> ctx_;
+        int last_errno_ = 0;
 
         bool await_ready() const noexcept { return false; }
 
@@ -174,12 +174,22 @@ async_net::Task<ssize_t> tun_device::async_read(void* buf, size_t len) {
             return true;
         }
 
-        ssize_t await_resume() const {
-            return ctx_->result();
+        ssize_t await_resume() {
+            auto r = ctx_->result();
+            if (r < 0) {
+                last_errno_ = ctx_->error();
+            }
+            return r;
         }
     };
 
-    co_return co_await ReadAwaiter{*this, buf, len, nullptr};
+    ReadAwaiter awaiter{*this, buf, len, nullptr};
+    auto n = co_await awaiter;
+    if (n < 0) {
+        // Store errno for caller to inspect
+        errno = awaiter.last_errno_;
+    }
+    co_return n;
 }
 
 async_net::Task<ssize_t> tun_device::async_write(const void* buf, size_t len) {

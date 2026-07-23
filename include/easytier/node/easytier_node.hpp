@@ -45,7 +45,7 @@ public:
     void stop();
 
     /// Get this node's ID.
-    NodeId node_id() const { return config_.node_id; }
+    NodeId node_id() const { return config_.my_peer_id; }
 
     /// Get this node's virtual IP.
     VirtualIP virtual_ip() const { return virtual_ip_; }
@@ -83,7 +83,7 @@ private:
     std::unique_ptr<peer_manager> peer_mgr_;
     std::unique_ptr<router> router_;
     std::unique_ptr<subnet_proxy> subnet_proxy_;
-    std::unique_ptr<dht_node> dht_;
+    std::unique_ptr<dht::dht_node> dht_;
     std::unique_ptr<web_api> web_;
 };
 

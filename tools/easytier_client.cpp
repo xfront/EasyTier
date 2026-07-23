@@ -4,12 +4,14 @@
 /// Creates a TUN device and routes traffic between the virtual network and peers.
 ///
 /// Usage: ./easytier_client [options]
-///   -r <host:port>    Registry server address (default: 127.0.0.1:11010)
+///   -r <host:port>    Server address (default: 183.230.36.171:11010)
 ///   -n <name>         Node name (default: easytier-node)
-///   -u <port>         Local UDP port for P2P (default: 12000)
-///   -t <port>         Local TCP port for relay (default: 12001)
+///   -N <net_name>     Network name (default: test)
+///   -S <secret>       Network secret
+///   -u <port>         Local UDP port for P2P (default: 0)
+///   -t <port>         Local TCP port for relay (default: 0)
 ///   -d <dev_name>     TUN device name (default: auto)
-///   -m <mtu>          MTU (default: 1400)
+///   -m <mtu>          MTU (default: 1380)
 
 #include <easytier/common/config.hpp>
 #include <easytier/node/easytier_node.hpp>
@@ -34,12 +36,14 @@ static void signal_handler(int) {
 static void print_usage(const char* prog) {
     std::fprintf(stderr, "Usage: %s [options]\n", prog);
     std::fprintf(stderr, "Options:\n");
-    std::fprintf(stderr, "  -r <host:port>  Registry server address (default: 127.0.0.1:11010)\n");
+    std::fprintf(stderr, "  -r <host:port>  Server address (default: 183.230.36.171:11010)\n");
     std::fprintf(stderr, "  -n <name>       Node name (default: easytier-node)\n");
-    std::fprintf(stderr, "  -u <port>       Local UDP port for P2P (default: 12000)\n");
-    std::fprintf(stderr, "  -t <port>       Local TCP port for relay (default: 12001)\n");
+    std::fprintf(stderr, "  -N <net_name>   Network name (default: test)\n");
+    std::fprintf(stderr, "  -S <secret>     Network secret\n");
+    std::fprintf(stderr, "  -u <port>       Local UDP port (default: 0)\n");
+    std::fprintf(stderr, "  -t <port>       Local TCP port (default: 0)\n");
     std::fprintf(stderr, "  -d <dev_name>   TUN device name (default: auto)\n");
-    std::fprintf(stderr, "  -m <mtu>        MTU (default: 1400)\n");
+    std::fprintf(stderr, "  -m <mtu>        MTU (default: 1380)\n");
     std::fprintf(stderr, "  -h              Show this help\n");
 }
 
@@ -48,7 +52,7 @@ int main(int argc, char* argv[]) {
 
     // Parse command line arguments
     int opt;
-    while ((opt = getopt(argc, argv, "r:n:u:t:d:m:h")) != -1) {
+    while ((opt = getopt(argc, argv, "r:n:N:S:u:t:d:m:h")) != -1) {
         switch (opt) {
         case 'r': {
             // Parse host:port
@@ -65,6 +69,12 @@ int main(int argc, char* argv[]) {
         }
         case 'n':
             config.name = optarg;
+            break;
+        case 'N':
+            config.network_name = optarg;
+            break;
+        case 'S':
+            config.network_secret = optarg;
             break;
         case 'u':
             config.udp_port = static_cast<uint16_t>(std::atoi(optarg));
@@ -89,9 +99,8 @@ int main(int argc, char* argv[]) {
 
     std::fprintf(stderr, "=== EasyTier Client ===\n");
     std::fprintf(stderr, "Node name: %s\n", config.name.c_str());
-    std::fprintf(stderr, "Registry: %s:%d\n", config.registry_host.c_str(), config.registry_port);
-    std::fprintf(stderr, "UDP port: %d\n", config.udp_port);
-    std::fprintf(stderr, "TCP port: %d\n", config.tcp_port);
+    std::fprintf(stderr, "Server: %s:%d\n", config.registry_host.c_str(), config.registry_port);
+    std::fprintf(stderr, "Network: %s\n", config.network_name.c_str());
     std::fprintf(stderr, "MTU: %d\n", config.mtu);
     std::fprintf(stderr, "Press Ctrl+C to stop\n\n");
 

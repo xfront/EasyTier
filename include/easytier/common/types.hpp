@@ -9,7 +9,11 @@
 namespace easytier {
 
 /// Unique identifier for each node in the virtual network.
-using NodeId = uint64_t;
+/// Now uint32_t, compatible with Rust EasyTier's PeerId.
+using NodeId = uint32_t;
+
+/// PeerId alias (Rust EasyTier naming)
+using PeerId = uint32_t;
 
 /// Virtual IP address (IPv4, stored as uint32_t in network byte order).
 using VirtualIP = uint32_t;
@@ -72,12 +76,11 @@ inline VirtualIP string_to_virtual_ip(const std::string& s) {
     return ip;
 }
 
-/// Generate a random NodeId.
+/// Generate a random NodeId (PeerId).
 inline NodeId generate_node_id() {
-    static uint64_t counter = 0;
-    // Use a combination of time-based and counter-based approach
+    static uint32_t counter = 0;
     auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-    return static_cast<NodeId>(now ^ (++counter * 6364136223846793005ULL));
+    return static_cast<NodeId>((now ^ (counter * 2654435761u)) & 0xFFFFFFFE);
 }
 
 } // namespace easytier

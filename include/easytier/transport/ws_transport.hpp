@@ -42,7 +42,7 @@ private:
     // Connected WebSocket peers
     struct ws_peer {
         std::shared_ptr<async_net::tcp::socket> sock;
-        std::unique_ptr<async_net::http::ws::connection> conn;
+        std::unique_ptr<async_net::http::ws::websocket_connection> conn;
         std::string remote_ip;
         uint16_t remote_port;
     };

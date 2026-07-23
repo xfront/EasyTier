@@ -54,11 +54,53 @@ if(NOT protobuf_FOUND)
 endif()
 
 # ============================================================
+# Protobuf code generation
+# ============================================================
+if(protobuf_FOUND)
+    message(STATUS "protobuf found, enabling protocol compatibility")
+    set(EASYTIER_PROTO_SRCS)
+    set(EASYTIER_PROTO_HDRS)
+    set(_PROTO_FILES
+        proto/error.proto
+        proto/common.proto
+        proto/peer_rpc.proto
+    )
+    # Build absolute paths for protoc
+    set(_PROTO_ABS_FILES)
+    foreach(_proto ${_PROTO_FILES})
+        list(APPEND _PROTO_ABS_FILES "${CMAKE_CURRENT_SOURCE_DIR}/${_proto}")
+    endforeach()
+    # Generate C++ sources from .proto files
+    foreach(_proto ${_PROTO_FILES})
+        get_filename_component(_proto_name ${_proto} NAME_WE)
+        list(APPEND EASYTIER_PROTO_SRCS "${CMAKE_CURRENT_BINARY_DIR}/${_proto_name}.pb.cc")
+        list(APPEND EASYTIER_PROTO_HDRS "${CMAKE_CURRENT_BINARY_DIR}/${_proto_name}.pb.h")
+    endforeach()
+    add_custom_command(
+        OUTPUT ${EASYTIER_PROTO_SRCS} ${EASYTIER_PROTO_HDRS}
+        COMMAND protobuf::protoc
+            --cpp_out=${CMAKE_CURRENT_BINARY_DIR}
+            --proto_path=${CMAKE_CURRENT_SOURCE_DIR}/proto
+            ${_PROTO_ABS_FILES}
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        DEPENDS ${_PROTO_FILES}
+        COMMENT "Generating protobuf C++ sources"
+    )
+    set(EASYTIER_PROTO_TARGET easytier_proto_gen)
+    add_custom_target(${EASYTIER_PROTO_TARGET} DEPENDS ${EASYTIER_PROTO_SRCS} ${EASYTIER_PROTO_HDRS})
+else()
+    message(WARNING "protobuf not found, protocol compatibility disabled")
+    set(EASYTIER_PROTO_SRCS)
+    set(EASYTIER_PROTO_TARGET "")
+endif()
+
+# ============================================================
 # EasyTier library
 # ============================================================
 set(EASYTIER_SOURCES
     # Common
     src/common/protocol.cpp
+    src/common/network_identity.cpp
 
     # TUN device (platform-specific)
     src/tun/tun_device.cpp
@@ -104,6 +146,12 @@ set(EASYTIER_SOURCES
 
     # KCP reliable UDP (Phase D)
     src/kcp/kcp_session.cpp
+
+    # RPC (protocol compatibility)
+    src/rpc/rpc_server.cpp
+
+    # Protobuf generated sources
+    ${EASYTIER_PROTO_SRCS}
 )
 
 # Platform-specific TUN device sources
@@ -121,8 +169,15 @@ else()
 endif()
 
 add_library(easytier_lib STATIC ${EASYTIER_SOURCES})
-target_include_directories(easytier_lib PUBLIC include PRIVATE src)
+target_include_directories(easytier_lib PUBLIC include ${CMAKE_CURRENT_BINARY_DIR} PRIVATE src)
 target_link_libraries(easytier_lib PUBLIC async_net)
+if(protobuf_FOUND)
+    target_link_libraries(easytier_lib PUBLIC protobuf::libprotobuf)
+    target_compile_definitions(easytier_lib PUBLIC EASYTIER_HAS_PROTOBUF=1)
+    if(EASYTIER_PROTO_TARGET)
+        add_dependencies(easytier_lib ${EASYTIER_PROTO_TARGET})
+    endif()
+endif()
 
 # ============================================================
 # Tools
@@ -135,3 +190,7 @@ target_link_libraries(easytier_server PRIVATE easytier_lib)
 # Client node
 add_executable(easytier_client tools/easytier_client.cpp)
 target_link_libraries(easytier_client PRIVATE easytier_lib)
+
+# Connection test tool
+add_executable(test_connect tools/test_connect.cpp)
+target_link_libraries(test_connect PRIVATE easytier_lib)

@@ -1,6 +1,7 @@
 #include <easytier/transport/transport_manager.hpp>
 #include <cstdio>
 #include <algorithm>
+#include <async_net/executor/schedule.hpp>
 
 namespace easytier {
 

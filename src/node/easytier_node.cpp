@@ -8,8 +8,8 @@ easytier_node::easytier_node(async_net::io_context& ctx, const node_config& conf
     : ctx_(&ctx), config_(config)
 {
     // Auto-generate node ID if not set
-    if (config_.node_id == 0) {
-        config_.node_id = generate_node_id();
+    if (config_.my_peer_id == 0) {
+        config_.my_peer_id = generate_node_id();
     }
 }
 
@@ -20,8 +20,8 @@ easytier_node::~easytier_node() {
 async_net::Task<void> easytier_node::run() {
     running_ = true;
 
-    std::fprintf(stderr, "[node] starting EasyTier node '%s' (id=%lu)\n",
-                 config_.name.c_str(), (unsigned long)config_.node_id);
+    std::fprintf(stderr, "[node] starting EasyTier node '%s' (id=%u)\n",
+                 config_.name.c_str(), config_.my_peer_id);
 
     // Step 1: Connect to registry OR bootstrap DHT
     if (config_.enable_dht && !config_.bootstrap_nodes.empty()) {
@@ -34,24 +34,42 @@ async_net::Task<void> easytier_node::run() {
         std::fprintf(stderr, "[node] DHT mode not fully implemented, falling back to registry\n");
     }
 
-    // Registry mode (default)
+    // Registry mode (default) — uses Rust-compatible protocol
     registry_ = std::make_unique<registry_client>(*ctx_);
+    registry_->set_network_identity(config_.network_name, config_.network_secret);
     bool ok = co_await registry_->connect(
         config_.registry_host.c_str(), config_.registry_port,
-        config_.node_id, config_.udp_port, config_.tcp_port, config_.name);
+        config_.my_peer_id, config_.udp_port, config_.tcp_port, config_.name);
 
     if (!ok) {
-        std::fprintf(stderr, "[node] failed to connect to registry at %s:%d\n",
+        std::fprintf(stderr, "[node] failed to connect to server at %s:%d\n",
                      config_.registry_host.c_str(), config_.registry_port);
         running_ = false;
         co_return;
     }
 
     virtual_ip_ = registry_->virtual_ip();
-    config_.node_id = registry_->node_id();
+    config_.my_peer_id = registry_->node_id();
 
-    std::fprintf(stderr, "[node] registered: node_id=%lu, virtual_ip=%s\n",
-                 (unsigned long)config_.node_id,
+    // If no VIP assigned by server, derive from peer_id
+    if (virtual_ip_ == 0) {
+        uint32_t pid = config_.my_peer_id;
+        // virtual_ip_to_string reads memory bytes directly (little-endian on x86)
+        // So for "10.a.b.c", memory must be [0x0A, a, b, c]
+        // uint32_t value (LE) = (c << 24) | (b << 16) | (a << 8) | 0x0A
+        uint8_t a = (pid >> 8) & 0xFF;
+        uint8_t b = (pid >> 16) & 0xFF;
+        uint8_t c = (pid >> 24) & 0xFF;
+        virtual_ip_ = (static_cast<VirtualIP>(c) << 24)
+                    | (static_cast<VirtualIP>(b) << 16)
+                    | (static_cast<VirtualIP>(a) << 8)
+                    | 10;
+        std::fprintf(stderr, "[node] derived VIP %s from peer_id %u\n",
+                     virtual_ip_to_string(virtual_ip_).c_str(), config_.my_peer_id);
+    }
+
+    std::fprintf(stderr, "[node] handshake complete: peer_id=%u, server_peer_id=%u, vip=%s\n",
+                 config_.my_peer_id, registry_->server_peer_id(),
                  virtual_ip_to_string(virtual_ip_).c_str());
 
     // Step 2: Create TUN device
@@ -69,7 +87,7 @@ async_net::Task<void> easytier_node::run() {
                  tun_->name().c_str(), tun_->ip_address().c_str());
 
     // Step 3: Start peer manager
-    peer_mgr_ = std::make_unique<peer_manager>(*ctx_, config_, config_.node_id, virtual_ip_);
+    peer_mgr_ = std::make_unique<peer_manager>(*ctx_, config_, config_.my_peer_id, virtual_ip_);
     auto* pm_task = new async_net::Task<void>(peer_mgr_->start());
     pm_task->resume();
 
@@ -81,7 +99,7 @@ async_net::Task<void> easytier_node::run() {
     // Step 5: Start subnet proxy
     subnet_proxy_ = std::make_unique<subnet_proxy>();
     for (const auto& subnet : config_.proxy_subnets) {
-        subnet_proxy_->announce_subnet(subnet, config_.node_id, virtual_ip_);
+        subnet_proxy_->announce_subnet(subnet, config_.my_peer_id, virtual_ip_);
     }
 
     // Step 6: Start web API (if enabled)
@@ -152,13 +170,12 @@ async_net::Task<void> easytier_node::registry_notification_loop() {
         }
 
         case msg_type::NODE_LEFT: {
-            if (f.payload.size() >= 8) {
+            if (f.payload.size() >= 4) {
                 NodeId nid = 0;
-                for (int i = 0; i < 8; ++i) {
+                for (int i = 0; i < 4; ++i) {
                     nid = (nid << 8) | f.payload[i];
                 }
-                std::fprintf(stderr, "[node] peer left: node %lu\n",
-                             (unsigned long)nid);
+                std::fprintf(stderr, "[node] peer left: node %u\n", nid);
 
                 if (peer_mgr_) {
                     peer_mgr_->remove_peer(nid);
@@ -232,7 +249,7 @@ async_net::Task<void> easytier_node::status_loop() {
         if (peer_mgr_ && !peers.empty()) {
             auto latencies = peer_mgr_->all_peer_latencies();
             for (const auto& [nid, lat] : latencies) {
-                std::fprintf(stderr, "[node]   peer %lu: %u ms\n", (unsigned long)nid, lat);
+                std::fprintf(stderr, "[node]   peer %u: %u ms\n", nid, lat);
             }
         }
     }

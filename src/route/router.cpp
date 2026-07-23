@@ -2,6 +2,7 @@
 #include <async_net/executor/schedule.hpp>
 #include <cstdio>
 #include <cstring>
+#include <cerrno>
 #include <arpa/inet.h>
 #include <algorithm>
 
@@ -36,14 +37,30 @@ async_net::Task<void> router::start() {
 }
 
 async_net::Task<void> router::tun_to_net_loop() {
+    int consecutive_errors = 0;
     while (running_ && tun_.is_open()) {
         auto n = co_await tun_.async_read(tun_buf_, TUN_BUF_SIZE);
         if (n <= 0) {
             if (running_) {
-                std::fprintf(stderr, "[router] TUN read error: %zd\n", n);
+                consecutive_errors++;
+                if (consecutive_errors <= 3) {
+                    std::fprintf(stderr, "[router] TUN read error: %zd errno=%d (%s)\n",
+                                 n, errno, std::strerror(errno > 0 ? errno : 0));
+                } else if (consecutive_errors == 4) {
+                    std::fprintf(stderr, "[router] TUN read errors continuing, suppressing logs\n");
+                }
+                // Wait a bit before retrying
+                co_await async_net::sleep_for(std::chrono::milliseconds(100), *ctx_);
             }
-            break;
+            // Don't break - TUN errors are not fatal
+            if (consecutive_errors > 100) {
+                // Too many consecutive errors, TUN device probably broken
+                std::fprintf(stderr, "[router] TUN device appears to be broken, stopping\n");
+                break;
+            }
+            continue;
         }
+        consecutive_errors = 0;  // Reset on success
 
         tun_to_net_.fetch_add(1);
 

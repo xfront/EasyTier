@@ -1,5 +1,6 @@
 #pragma once
 
+#include <easytier/common/zc_packet.hpp>
 #include <async_net/crypto/aes_gcm.hpp>
 #include <cstdint>
 #include <cstddef>
@@ -7,76 +8,73 @@
 #include <vector>
 #include <array>
 #include <cstring>
+#include <string>
 
 namespace easytier::crypto {
 
-/// Session cipher — AES-256-GCM encryption for peer-to-peer data frames.
+/// Session cipher — AES-GCM encryption compatible with Rust EasyTier.
 ///
-/// Wire format for encrypted payload:
-///   [seq:4][nonce:8][ciphertext:N][tag:16]
+/// Rust wire format for encrypted payload (after PeerManagerHeader):
+///   [original_payload][tag:16][nonce:12]
 ///
-/// The AAD (additional authenticated data) contains:
-///   [src_node_id:8][dst_node_id:8][seq:4]
-/// to prevent replay and misdirection attacks.
+/// The PeerManagerHeader.flags bit 0 (ENCRYPTED) is set when encrypted.
+/// AES-GCM is used with empty AAD (no additional authenticated data).
 ///
-/// Usage:
-///   session_cipher cipher(shared_key);
-///   auto encrypted = cipher.encrypt(plaintext, len, seq, src, dst);
-///   auto decrypted = cipher.decrypt(encrypted_data, len, src, dst);
+/// Two key sizes supported:
+///   - AES-128-GCM: 16-byte key (default in Rust)
+///   - AES-256-GCM: 32-byte key
 class session_cipher {
 public:
-    static constexpr size_t KEY_LEN = 32;
-    static constexpr size_t NONCE_LEN = 8;
-    static constexpr size_t SEQ_LEN = 4;
-    static constexpr size_t TAG_LEN = 16;
-    static constexpr size_t OVERHEAD = SEQ_LEN + NONCE_LEN + TAG_LEN;  // 28 bytes
+    static constexpr size_t KEY_LEN_128 = 16;
+    static constexpr size_t KEY_LEN_256 = 32;
+    static constexpr size_t TAG_LEN     = 16;
+    static constexpr size_t NONCE_LEN   = 12;
+    static constexpr size_t TAIL_SIZE   = TAG_LEN + NONCE_LEN; // 28
 
-    /// Construct with a 32-byte shared key.
-    explicit session_cipher(const uint8_t key[KEY_LEN]);
+    /// Construct with a 16-byte key (AES-128-GCM, Rust default)
+    explicit session_cipher(const uint8_t key[KEY_LEN_128]);
 
-    /// Construct from a vector key.
+    /// Construct with a 32-byte key (AES-256-GCM)
+    session_cipher(const uint8_t key[KEY_LEN_256], bool use_256);
+
+    /// Construct from vector key (auto-detect size)
     explicit session_cipher(const std::vector<uint8_t>& key);
 
-    /// Encrypt plaintext with sequence number and node IDs for AAD.
-    /// Returns: [seq:4][nonce:8][ciphertext:N][tag:16]
-    std::vector<uint8_t> encrypt(const uint8_t* plaintext, size_t len,
-                                  uint32_t seq,
-                                  uint64_t src_node, uint64_t dst_node);
+    /// Encrypt a ZCPacket in-place.
+    /// Appends [tag:16][nonce:12] to payload and sets ENCRYPTED flag.
+    /// Returns true on success.
+    bool encrypt(zc_packet& pkt);
 
-    /// Decrypt ciphertext. Returns plaintext on success, nullopt on auth failure.
-    /// Input: [seq:4][nonce:8][ciphertext:N][tag:16]
-    std::optional<std::vector<uint8_t>> decrypt(const uint8_t* data, size_t len,
-                                                  uint64_t src_node, uint64_t dst_node);
+    /// Decrypt a ZCPacket in-place.
+    /// Reads [tag:16][nonce:12] from payload tail, decrypts, clears ENCRYPTED flag.
+    /// Returns true on success, false on auth failure.
+    bool decrypt(zc_packet& pkt);
 
-    /// Get the next sequence number (auto-incrementing).
-    uint32_t next_seq() { return send_seq_++; }
+    /// Encrypt raw payload bytes. Returns [ciphertext][tag:16][nonce:12].
+    std::vector<uint8_t> encrypt_raw(const uint8_t* plaintext, size_t len);
 
-    /// Get the current send sequence number.
-    uint32_t current_seq() const { return send_seq_; }
+    /// Decrypt raw payload bytes. Input: [ciphertext][tag:16][nonce:12].
+    /// Returns plaintext on success, nullopt on failure.
+    std::optional<std::vector<uint8_t>> decrypt_raw(const uint8_t* data, size_t len);
 
-    /// Derive a session key from a shared secret using HKDF-SHA256.
-    /// Uses the async_net AES-GCM random_bytes for salt generation.
+    /// Get the encryption algorithm name (for handshake)
+    std::string algorithm_name() const { return is_256_ ? "aes-gcm-256" : "aes-gcm"; }
+
+    /// Derive a session key from shared secret using HKDF-SHA256
     static std::vector<uint8_t> derive_key(const uint8_t* shared_secret, size_t secret_len,
                                             const uint8_t* salt, size_t salt_len,
                                             const char* info, size_t info_len);
 
-    /// Generate a random 32-byte key.
-    static std::vector<uint8_t> generate_key();
+    /// Generate a random key (16 or 32 bytes)
+    static std::vector<uint8_t> generate_key(size_t len = KEY_LEN_128);
 
 private:
-    /// Build AAD bytes: [src_node:8][dst_node:8][seq:4]
-    void build_aad(uint8_t* aad, uint64_t src_node, uint64_t dst_node, uint32_t seq) const;
-
-    /// Build 12-byte nonce for AES-GCM: [fixed:4][counter:8]
-    void build_nonce(uint8_t* nonce, uint32_t seq) const;
-
-    std::array<uint8_t, KEY_LEN> key_;
-    uint32_t send_seq_ = 0;
-    uint32_t recv_seq_ = 0;  // For replay protection
+    std::array<uint8_t, KEY_LEN_256> key_{};
+    size_t key_len_;
+    bool is_256_;
 };
 
-/// Derive a shared key from a pre-shared key (PSK) string.
-/// Uses SHA-256 hash of the PSK as the key material.
+/// Derive a key from a pre-shared key string using SHA-256
 std::vector<uint8_t> psk_to_key(const std::string& psk);
 
 } // namespace easytier::crypto
